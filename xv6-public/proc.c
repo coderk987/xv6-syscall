@@ -20,10 +20,78 @@ extern void trapret(void);
 
 static void wakeup1(void *chan);
 
+#define QUEUE_SIZE NPROC
+
+struct queue {
+    struct proc *data[QUEUE_SIZE];
+    int front;
+    int rear;
+    int size;
+};
+
+void init_queue(struct queue *q)
+{
+    q->front = 0;
+    q->rear = 0;
+    q->size = 0;
+}
+
+int is_empty(struct queue *q)
+{
+    return q->size == 0;
+}
+
+int is_full(struct queue *q)
+{
+    return q->size == QUEUE_SIZE;
+}
+
+int enqueue(struct queue *q, struct proc *p)
+{
+    if (is_full(q))
+        return -1;
+
+    q->data[q->rear] = p;
+    q->rear = (q->rear + 1) % QUEUE_SIZE;
+    q->size++;
+
+    return 0;
+}
+
+struct proc *dequeue(struct queue *q)
+{
+    struct proc *p;
+
+    if (is_empty(q))
+        return 0;
+
+    p = q->data[q->front];
+    q->front = (q->front + 1) % QUEUE_SIZE;
+    q->size--;
+
+    return p;
+}
+
+struct proc *peek(struct queue *q)
+{
+    if (is_empty(q))
+        return 0;
+
+    return q->data[q->front];
+}
+
+struct queue Qs[4];
+static uint seed = 12345;
+
 void
 pinit(void)
 {
   initlock(&ptable.lock, "ptable");
+  init_queue(&Qs[0]);
+  init_queue(&Qs[1]);
+  init_queue(&Qs[2]);
+  init_queue(&Qs[3]);
+  cprintf("Initialized Queues\n");
 }
 
 // Must be called with interrupts disabled
@@ -149,6 +217,8 @@ userinit(void)
   acquire(&ptable.lock);
 
   p->state = RUNNABLE;
+  enqueue(&Qs[3], p);
+  cprintf("Added init to Q3 ---> %d\n", is_empty(&Qs[3]));
 
   release(&ptable.lock);
 }
@@ -215,6 +285,7 @@ fork(void)
   acquire(&ptable.lock);
 
   np->state = RUNNABLE;
+  enqueue(&Qs[3], np);
 
   release(&ptable.lock);
 
@@ -322,9 +393,13 @@ wait(void)
 void
 scheduler(void)
 {
-  struct proc *p;
   struct cpu *c = mycpu();
   c->proc = 0;
+
+  static int ticks[4] = {8, 16, 32, 64};
+
+  //cprintf("Scheduler entered\n");
+  //cprintf("Q3 size = %d\n", Qs[3].size);
   
   for(;;){
     // Enable interrupts on this processor.
@@ -332,26 +407,73 @@ scheduler(void)
 
     // Loop over process table looking for process to run.
     acquire(&ptable.lock);
-    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
-      if(p->state != RUNNABLE)
-        continue;
 
-      // Switch to chosen process.  It is the process's job
-      // to release ptable.lock and then reacquire it
-      // before jumping back to us.
-      c->proc = p;
-      switchuvm(p);
-      p->state = RUNNING;
+    //one by one run based on priority 
+  restart:
+    for(int i=3;i>=0;i--){
+      while(!is_empty(&Qs[i])){
+        //checking if a higher priority is not empty now
+        for(int higher=3;higher>i;higher++){
+          if(!is_empty(&Qs[higher])){
+            goto restart;
+          }
+        }
 
-      swtch(&(c->scheduler), p->context);
-      switchkvm();
+        struct proc *curproc = dequeue(&Qs[i]);
+        int isEarlyQuit = 0;
+        for(int k=0;k<ticks[i];k++){
+          //If its sleeping maintain its priority
+          if(curproc->state==SLEEPING){
+            //enqueue(&Qs[i], curproc);
+            isEarlyQuit=1;
+            break;
+          }
+          //If its killed remove it
+          if(curproc->state==ZOMBIE){
+            break;
+          }
 
-      // Process is done running for now.
-      // It should have changed its p->state before coming back.
-      c->proc = 0;
+          if(curproc->state==RUNNABLE){
+            //cprintf("About to run pid=%d\n", curproc->pid);
+
+            c->proc = curproc;
+            switchuvm(curproc);
+            curproc->state = RUNNING;
+            swtch(&(c->scheduler), curproc->context);
+            /*cprintf("Returned from pid=%d state=%d\n",
+            curproc->pid,
+            curproc->state)*/;
+            switchkvm();
+          }
+        }
+        c->proc = 0;
+        //Demote process
+        if(!isEarlyQuit && i>0 && curproc->state==RUNNABLE){
+          enqueue(&Qs[i-1], curproc);
+        }
+        if(i==0){
+          enqueue(&Qs[0], curproc);
+        }
+
+        //periodic boost
+        // q2:p, q1:2p, q0:4p, none: 21p, total 28p
+        seed = seed * 1103515245 + 12345;
+        int winner = seed % 28;
+        if(winner<7){
+          if(winner<=3 && !is_empty(&Qs[0])){
+            struct proc *boost = dequeue(&Qs[0]);
+            enqueue(&Qs[3], boost);
+          }else if(winner<=5 && !is_empty(&Qs[1])){
+            struct proc *boost = dequeue(&Qs[1]);
+            enqueue(&Qs[3], boost);
+          }else if(winner==6 && !is_empty(&Qs[2])){
+            struct proc *boost = dequeue(&Qs[2]);
+            enqueue(&Qs[3], boost);
+          }
+        }
+      }
     }
     release(&ptable.lock);
-
   }
 }
 
@@ -387,6 +509,7 @@ yield(void)
 {
   acquire(&ptable.lock);  //DOC: yieldlock
   myproc()->state = RUNNABLE;
+  enqueue(&Qs[3], myproc());
   sched();
   release(&ptable.lock);
 }
@@ -459,9 +582,12 @@ wakeup1(void *chan)
 {
   struct proc *p;
 
-  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++)
-    if(p->state == SLEEPING && p->chan == chan)
+  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+    if(p->state == SLEEPING && p->chan == chan){
       p->state = RUNNABLE;
+      enqueue(&Qs[3], p);
+    }
+  }
 }
 
 // Wake up all processes sleeping on chan.
